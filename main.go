@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"syscall/js"
 
 	"github.com/nobonobo/spago"
@@ -12,6 +13,7 @@ var (
 )
 
 func main() {
+	log.SetFlags(log.Ltime | log.Lshortfile)
 	spago.RenderBody(&Top{JsCode: src})
 	select {}
 }
