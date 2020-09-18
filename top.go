@@ -53,8 +53,11 @@ func (c *Top) OnSubmit(ev js.Value) {
 		js.Global().Call("alert", err.Error())
 		return
 	}
-	b, err := format.Source([]byte(strings.Join(res, "\n")))
+	generated := strings.Join(res, "\n")
+	b, err := format.Source([]byte(generated))
 	if err != nil {
+		c.GoCode = generated
+		spago.Rerender(c)
 		js.Global().Call("alert", err.Error())
 		return
 	}
