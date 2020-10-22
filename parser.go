@@ -349,7 +349,8 @@ func (p *Parser) parseParams(obj js.Value) []string {
 }
 
 func (p *Parser) parseFunctionDeclaration(obj js.Value) []string {
-	console.Call("log", p.indent(), "FunctionDeclaration:", obj)
+	async := strings.HasPrefix(obj.Get("constructor").Get("name").String(), "Async")
+	console.Call("log", p.indent(), "FunctionDeclaration:", obj, async)
 	id := p.parseIdentifier(obj.Get("id"))
 	p.define(id, true)
 	p.push(obj)
@@ -359,7 +360,13 @@ func (p *Parser) parseFunctionDeclaration(obj js.Value) []string {
 		id,
 		strings.Join(params, ", "),
 	)}
+	if async {
+		res = append(res, "go func() {")
+	}
 	res = append(res, p.parseStatement(obj.Get("body"))...)
+	if async {
+		res = append(res, "} ()")
+	}
 	res = append(res, "}")
 	return res
 }
@@ -376,12 +383,19 @@ func (p *Parser) parseFunctionExpression(obj js.Value) []string {
 }
 
 func (p *Parser) parseArrowFunctionExpression(obj js.Value) []string {
-	console.Call("log", p.indent(), "ArrowFunctionExpression:", obj)
+	async := strings.HasPrefix(obj.Get("constructor").Get("name").String(), "Async")
+	console.Call("log", p.indent(), "ArrowFunctionExpression:", obj, async)
 	p.push(obj)
 	defer p.pop()
 	params := p.parseParams(obj.Get("params"))
 	res := []string{fmt.Sprintf("func(%s) {", strings.Join(params, ", "))}
+	if async {
+		res = append(res, "go func() {")
+	}
 	res = append(res, p.parseStatement(obj.Get("body"))...)
+	if async {
+		res = append(res, "}()")
+	}
 	res = append(res, "}")
 	return res
 }
