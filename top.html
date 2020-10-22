@@ -17,13 +17,17 @@
         </div>
         <div class="column col-6">
           <div class="float-right">
-            <button class="btn btn-primary">Copy</button>
+            <button class="btn btn-primary" @click="{{c.OnCopy}}">Copy</button>
           </div>
-          <textarea class="form-input" rows="12" readonly>
+          <textarea class="form-input" rows="12" id="code" readonly>
 {{c.GoCode}}</textarea
           >
         </div>
       </form>
+      <p>
+        If you use 'await' keyword, you need to import
+        "github.com/nobonobo/spago/jsutil"
+      </p>
     </div>
   </div>
 </body>

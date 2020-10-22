@@ -64,3 +64,11 @@ func (c *Top) OnSubmit(ev js.Value) {
 	c.GoCode = string(b)
 	spago.Rerender(c)
 }
+
+// OnCopy ...
+func (c *Top) OnCopy(ev js.Value) {
+	ev.Call("preventDefault")
+	var copyText = js.Global().Get("document").Call("querySelector", "#code")
+	copyText.Call("select")
+	js.Global().Get("document").Call("execCommand", "copy")
+}
