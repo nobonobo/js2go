@@ -7,17 +7,35 @@ import (
 	"syscall/js"
 )
 
-const src = `function hoge() {console.log(window)}
-`
+const src = `async function on_click() {
+	let device = await navigator.bluetooth.requestDevice({ filters: [{ services: ["battery_service"] }] })
+}`
 
 // Parser ...
 type Parser struct {
-	stack []js.Value
+	stack []stack
 	err   error
+}
+
+type stack struct {
+	obj    js.Value
+	scope  map[string]bool
+	define bool
+	prefix []string
+	suffix []string
+}
+
+func (s *stack) append(src []string) []string {
+	res := s.prefix
+	res = append(res, src...)
+	res = append(res, s.suffix...)
+	return res
 }
 
 // ParseProgram ...
 func (p *Parser) ParseProgram(obj js.Value) ([]string, error) {
+	p.push(obj)
+	defer p.pop()
 	res := p.parseArray(obj.Get("body"))
 	if p.err != nil {
 		return nil, p.err
@@ -26,10 +44,10 @@ func (p *Parser) ParseProgram(obj js.Value) ([]string, error) {
 }
 
 func (p *Parser) push(obj js.Value) {
-	p.stack = append(p.stack, obj)
+	p.stack = append(p.stack, stack{obj: obj, scope: map[string]bool{}})
 }
 
-func (p *Parser) pop() js.Value {
+func (p *Parser) pop() stack {
 	popped := p.stack[len(p.stack)-1]
 	p.stack = p.stack[:len(p.stack)-1]
 	return popped
@@ -37,6 +55,86 @@ func (p *Parser) pop() js.Value {
 
 func (p *Parser) indent() string {
 	return strings.Repeat("  ", len(p.stack))
+}
+
+func (p *Parser) setDefineMode(b bool) {
+	p.stack[len(p.stack)-1].define = b
+}
+
+func (p *Parser) getDefineMode() bool {
+	return p.stack[len(p.stack)-1].define
+}
+
+func (p *Parser) define(sym string, native bool) {
+	p.stack[len(p.stack)-1].scope[sym] = native
+}
+
+func (p *Parser) defined(sym string) bool {
+	for i := len(p.stack) - 1; i >= 0; i-- {
+		_, ok := p.stack[i].scope[sym]
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Parser) definedAndType(sym string) (bool, bool) {
+	for i := len(p.stack) - 1; i >= 0; i-- {
+		tp, ok := p.stack[i].scope[sym]
+		if ok {
+			return true, tp
+		}
+	}
+	return false, false
+}
+
+func (p *Parser) parseIdentifier(obj js.Value) string {
+	return obj.Get("name").String()
+}
+
+func (p *Parser) parseIdentifierRef(obj js.Value) []string {
+	console.Call("log", p.indent(), "Identifier:", obj)
+	name := obj.Get("name").String()
+	if name == "window" {
+		return []string{"js.Global()"}
+	}
+	if p.defined(name) {
+		return []string{name}
+	}
+	return []string{fmt.Sprintf("js.Global().Get(%q)", name)}
+}
+
+func (p *Parser) parseProperty(obj js.Value) []string {
+	console.Call("log", p.indent(), "Property:", obj)
+	key := p.parseStatement(obj.Get("key"))[0]
+	value := p.parseStatement(obj.Get("value"))[0]
+	res := []string{fmt.Sprintf("%q: %s", key, value)}
+	return res
+}
+
+func (p *Parser) parseArrayExpression(obj js.Value) []string {
+	console.Call("log", p.indent(), "ArrayExpression:", obj)
+	elements := p.parseArray(obj.Get("elements"))
+	res := []string{"[]interface{}{"}
+	switch len(elements) {
+	case 0:
+		res[0] += "}"
+	case 1:
+		res[0] += elements[0] + "}"
+	default:
+		for _, v := range elements {
+			res = append(res, v+",")
+		}
+		res = append(res, "}")
+	}
+	return res
+}
+
+func (p *Parser) parseThisExpression(obj js.Value) []string {
+	console.Call("log", p.indent(), "ThisExpression:", obj)
+	res := []string{}
+	return res
 }
 
 func (p *Parser) parseLiteral(obj js.Value) []string {
@@ -62,11 +160,6 @@ func (p *Parser) parseLiteral(obj js.Value) []string {
 
 func (p *Parser) parseVariableDeclaration(obj js.Value) []string {
 	console.Call("log", p.indent(), "VariableDeclaration:", obj)
-	p.push(obj)
-	defer p.pop()
-	for i, v := range p.stack {
-		log.Print(i, v.Get("type").String())
-	}
 	kind := obj.Get("kind").String()
 	decls := obj.Get("declarations")
 	if kind == "let" {
@@ -92,84 +185,178 @@ func (p *Parser) parseVariableDeclaration(obj js.Value) []string {
 
 func (p *Parser) parseVariableDeclarator(obj js.Value) []string {
 	console.Call("log", p.indent(), "VariableDeclarator:", obj)
-	p.push(obj)
-	defer p.pop()
-	id := p.parseIdentifier(obj.Get("id"))[0]
+	id := p.parseIdentifier(obj.Get("id"))
+	p.define(id, true)
 	init := obj.Get("init")
 	if init.IsNull() {
 		return []string{fmt.Sprintf("%s = nil", id)}
+	}
+	switch init.Get("type").String() {
+	case "AwaitExpression":
+		id += ", err"
+	case "MemberExpression":
+		prop := p.parseMemberExpression(init)
+		return []string{fmt.Sprintf("%s = %s.Get(%q)", id, prop[0], prop[1])}
+	default:
 	}
 	res := p.parseStatement(init)
 	return append([]string{fmt.Sprintf("%s = %s", id, res[0])}, res[1:]...)
 }
 
-func (p *Parser) parseIdentifier(obj js.Value) []string {
-	console.Call("log", p.indent(), "Identifier:", obj)
-	name := obj.Get("name").String()
-	if name == "window" {
-		name = "js.Global()"
+func (p *Parser) buildGetChain(args []string) string {
+	res := []string{}
+	if p.stack[len(p.stack)-1].obj.Get("type").String() == "CallExpression" {
+		res = append(res, "js.Global()")
+	} else {
+		res = append(res, args[0])
+		args = args[1:]
 	}
-	return []string{name}
-}
-
-func (p *Parser) parseMemberExpression(obj js.Value) []string {
-	console.Call("log", p.indent(), "MemberExpression:", obj)
-	res := p.parseStatement(obj.Get("object"))
-	res = append(res, p.parseStatement(obj.Get("property"))...)
-	return res
-}
-
-func buildGetChain(args []string) string {
-	res := []string{"js.Global()"}
 	for _, v := range args {
 		res = append(res, fmt.Sprintf("Get(%q)", v))
 	}
 	return strings.Join(res, ".")
 }
 
+func (p *Parser) parseMemberExpression(obj js.Value) []string {
+	console.Call("log", p.indent(), "MemberExpression:", obj)
+	target := obj.Get("object")
+	res := []string{}
+	switch target.Get("type").String() {
+	case "MemberExpression":
+		res = append(res, p.buildGetChain(p.parseStatement(target)))
+	default:
+		res = append(res, p.parseStatement(target)...)
+	}
+	res = append(res, p.parseIdentifier(obj.Get("property")))
+	return res
+}
+
 func (p *Parser) parseCallExpression(obj js.Value) []string {
 	console.Call("log", p.indent(), "CallExpression:", obj)
-	p.push(obj)
-	defer p.pop()
 	callee := obj.Get("callee")
-	args := p.parseArray(obj.Get("arguments"))
-
+	args := obj.Get("arguments")
 	switch callee.Get("type").String() {
 	default:
 		res := p.parseStatement(callee)
-		res[len(res)-1] += "()"
+		switch args.Length() {
+		case 0:
+			res[len(res)-1] += "()"
+		case 1:
+			param := p.parseStatement(args.Index(0))
+			res[len(res)-1] += fmt.Sprintf("(%s, ", param[0])
+			res = append(res, param[1:]...)
+			res[len(res)-1] += ")"
+		default:
+			res[len(res)-1] += "("
+			for i := 0; i < args.Length(); i++ {
+				res = append(res, p.parseStatement(args.Index(i))...)
+				res[len(res)-1] += ","
+			}
+			res = append(res, ")")
+		}
+		return res
+	case "Identifier":
+		sym := p.parseIdentifier(callee)
+		res := []string{}
+		if def, tp := p.definedAndType(sym); def {
+			if tp {
+				res = append(res, fmt.Sprintf("%s(", sym))
+			} else {
+				res = append(res, fmt.Sprintf("%s.Invoke(", sym))
+			}
+			switch args.Length() {
+			case 0:
+				res[len(res)-1] += ")"
+			case 1:
+				res[len(res)-1] += p.parseStatement(args.Index(0))[0]
+				res[len(res)-1] += ")"
+			default:
+				for i := 0; i < args.Length(); i++ {
+					res = append(res, p.parseStatement(args.Index(i))...)
+					res[len(res)-1] += ","
+				}
+				res = append(res, ")")
+			}
+		} else {
+			res = append(res, fmt.Sprintf("js.Global().Call(%q", sym))
+			log.Println("sym", sym, "args", args, res)
+			switch args.Length() {
+			case 0:
+				res[len(res)-1] += ")"
+			case 1:
+				res[len(res)-1] += ", "
+				res[len(res)-1] += p.parseStatement(args.Index(0))[0]
+				res[len(res)-1] += ")"
+			default:
+				for i := 0; i < args.Length(); i++ {
+					res = append(res, p.parseStatement(args.Index(i))...)
+				}
+				res = append(res, ")")
+			}
+		}
 		return res
 	case "MemberExpression":
 		static := p.parseStatement(callee)
-		parent, fn := static[:len(static)-1], static[len(static)-1]
-		log.Println(parent, fn)
-		switch len(args) {
+		res, fn := static[:len(static)-1], static[len(static)-1]
+		res[len(res)-1] += fmt.Sprintf(".Call(%q", fn)
+		switch args.Length() {
 		case 0:
-			return []string{
-				buildGetChain(parent) + fmt.Sprintf(".Call(%q)", fn),
-			}
+			res[len(res)-1] += ")"
 		case 1:
-			return []string{
-				buildGetChain(parent) + fmt.Sprintf(".Call(%q, %s)", fn, strings.Join(args, ", ")),
-			}
+			res[len(res)-1] += ", "
+			res[len(res)-1] += p.parseStatement(args.Index(0))[0]
+			res[len(res)-1] += ")"
 		default:
+			for i := 0; i < args.Length(); i++ {
+				res = append(res, p.parseStatement(args.Index(i))...)
+			}
+			res = append(res, ")")
 		}
-		res := []string{buildGetChain(parent) + fmt.Sprintf(".Call(%q,", fn)}
-		for _, arg := range args {
-			res = append(res, arg+",")
-		}
-		res = append(res, ")")
 		return res
 	}
 }
 
+func (p *Parser) parseObjectExpression(obj js.Value) []string {
+	console.Call("log", p.indent(), "ObjectExpression:", obj)
+	p.setDefineMode(true)
+	defer p.setDefineMode(false)
+	properties := p.parseArray(obj.Get("properties"))
+	res := []string{}
+	switch len(properties) {
+	case 0:
+		res = append(res, "map[string]interface{}{}")
+	case 1:
+		res = append(res, fmt.Sprintf("map[string]interface{}{%s}", properties[0]))
+	default:
+		res = append(res, "map[string]interface{}{")
+		for _, v := range properties {
+			res = append(res, v+",")
+		}
+		res = append(res, "}")
+	}
+	return res
+}
+
+func (p *Parser) parseParams(obj js.Value) []string {
+	console.Call("log", p.indent(), "ParamsArray:", obj)
+	res := []string{}
+	for i := 0; i < obj.Length(); i++ {
+		id := p.parseIdentifier(obj.Index(i))
+		p.define(id, false)
+		res = append(res, fmt.Sprintf("%s js.Value", id))
+	}
+	return res
+}
+
 func (p *Parser) parseFunctionDeclaration(obj js.Value) []string {
 	console.Call("log", p.indent(), "FunctionDeclaration:", obj)
+	id := p.parseIdentifier(obj.Get("id"))
+	p.define(id, true)
 	p.push(obj)
 	defer p.pop()
-	params := p.parseArray(obj.Get("params"))
+	params := p.parseParams(obj.Get("params"))
 	res := []string{fmt.Sprintf("func %s(%s) {",
-		p.parseIdentifier(obj.Get("id"))[0],
+		id,
 		strings.Join(params, ", "),
 	)}
 	res = append(res, p.parseStatement(obj.Get("body"))...)
@@ -181,7 +368,8 @@ func (p *Parser) parseFunctionExpression(obj js.Value) []string {
 	console.Call("log", p.indent(), "FunctionExpression:", obj)
 	p.push(obj)
 	defer p.pop()
-	res := []string{"func(){"}
+	params := p.parseParams(obj.Get("params"))
+	res := []string{fmt.Sprintf("func(%s) {", strings.Join(params, ", "))}
 	res = append(res, p.parseStatement(obj.Get("body"))...)
 	res = append(res, "}")
 	return res
@@ -191,93 +379,166 @@ func (p *Parser) parseArrowFunctionExpression(obj js.Value) []string {
 	console.Call("log", p.indent(), "ArrowFunctionExpression:", obj)
 	p.push(obj)
 	defer p.pop()
-	res := []string{"func(){"}
+	params := p.parseParams(obj.Get("params"))
+	res := []string{fmt.Sprintf("func(%s) {", strings.Join(params, ", "))}
 	res = append(res, p.parseStatement(obj.Get("body"))...)
 	res = append(res, "}")
 	return res
 }
 
-func (p *Parser) parseMethodDefinition(obj js.Value) {
+func (p *Parser) parseMethodDefinition(obj js.Value) []string {
 	console.Call("log", p.indent(), "MethodDefinition:", obj)
 	p.push(obj)
 	defer p.pop()
 	p.parseFunctionDeclaration(obj.Get("value"))
+	res := []string{}
+	return res
 }
 
-func (p *Parser) parseSwitchStatement(obj js.Value) {
+func (p *Parser) parseSwitchStatement(obj js.Value) []string {
 	console.Call("log", p.indent(), "SwitchStatement:", obj)
 	p.push(obj)
 	defer p.pop()
 	p.parseArray(obj.Get("cases"))
+	res := []string{}
+	return res
 }
 
-func (p *Parser) parseWhileStatement(obj js.Value) {
+func (p *Parser) parseSwitchCase(obj js.Value) []string {
+	console.Call("log", p.indent(), "SwitchCase:", obj)
+	res := []string{}
+	return res
+}
+
+func (p *Parser) parseWhileStatement(obj js.Value) []string {
 	console.Call("log", p.indent(), "WhileStatement:", obj)
 	p.push(obj)
 	defer p.pop()
 	p.parseStatement(obj.Get("body"))
+	res := []string{}
+	return res
 }
 
-func (p *Parser) parseDoWhileStatement(obj js.Value) {
+func (p *Parser) parseDoWhileStatement(obj js.Value) []string {
 	console.Call("log", p.indent(), "DoWhileStatement:", obj)
 	p.push(obj)
 	defer p.pop()
 	p.parseStatement(obj.Get("body"))
+	res := []string{}
+	return res
 }
 
-func (p *Parser) parseForStatement(obj js.Value) {
+func (p *Parser) parseForStatement(obj js.Value) []string {
 	console.Call("log", p.indent(), "ForStatement:", obj)
 	p.push(obj)
 	defer p.pop()
 	p.parseStatement(obj.Get("body"))
+	res := []string{}
+	return res
 }
 
-func (p *Parser) parseForInStatement(obj js.Value) {
+func (p *Parser) parseForInStatement(obj js.Value) []string {
 	console.Call("log", p.indent(), "ForInStatement:", obj)
 	p.push(obj)
 	defer p.pop()
 	p.parseStatement(obj.Get("body"))
+	res := []string{}
+	return res
 }
 
-func (p *Parser) parseIfStatement(obj js.Value) {
+func (p *Parser) parseIfStatement(obj js.Value) []string {
 	console.Call("log", p.indent(), "IfStatement:", obj)
 	p.push(obj)
 	defer p.pop()
 	p.parseStatement(obj.Get("consequent"))
+	res := []string{}
+	return res
 }
 
-func (p *Parser) parseTryStatement(obj js.Value) {
+func (p *Parser) parseTryStatement(obj js.Value) []string {
 	console.Call("log", p.indent(), "TryStatement:", obj)
 	p.push(obj)
 	defer p.pop()
 	p.parseStatement(obj.Get("block"))
+	res := []string{}
+	return res
 }
 
-func (p *Parser) parseAssignmentExpression(obj js.Value) {
+func (p *Parser) parseAssignmentExpression(obj js.Value) []string {
 	console.Call("log", p.indent(), "AssignmentExpression:", obj)
-	p.push(obj)
-	defer p.pop()
+	res := []string{}
 	p.parseStatement(obj.Get("left"))
 	p.parseStatement(obj.Get("right"))
+	return res
 }
 
-func (p *Parser) parseClassDeclaration(obj js.Value) {
+func (p *Parser) parseClassDeclaration(obj js.Value) []string {
 	console.Call("log", p.indent(), "ClassDeclaration:", obj)
 	p.push(obj)
 	defer p.pop()
 	p.parseStatement(obj.Get("body"))
+	res := []string{}
+	return res
 }
 
 func (p *Parser) parseAwaitExpression(obj js.Value) []string {
 	console.Call("log", p.indent(), "AwaitExpression:", obj)
-	p.push(obj)
-	defer p.pop()
 	res := p.parseCallExpression(obj.Get("argument"))
 	return []string{fmt.Sprintf("jsutil.Await(%s)", strings.Join(res, ", "))}
 }
 
-func (p *Parser) parseReturnStatement(obj js.Value) {
+func (p *Parser) parseConditionalExpression(obj js.Value) []string {
+	console.Call("log", p.indent(), "ConditionalExpression:", obj)
+	res := []string{}
+	return res
+}
+
+func (p *Parser) parseReturnStatement(obj js.Value) []string {
 	console.Call("log", p.indent(), "ReturnStatement:", obj)
+	res := []string{}
+	return res
+}
+
+func (p *Parser) parseSequenceExpression(obj js.Value) []string {
+	console.Call("log", p.indent(), "SequenceExpression:", obj)
+	res := []string{}
+	return res
+}
+
+func (p *Parser) parseThrowStatement(obj js.Value) []string {
+	console.Call("log", p.indent(), "ThrowStatement:", obj)
+	res := []string{}
+	return res
+}
+
+func (p *Parser) parseUpdateExpression(obj js.Value) []string {
+	console.Call("log", p.indent(), "UpdateExpression:", obj)
+	res := []string{}
+	return res
+}
+
+func (p *Parser) parseContinueStatement(obj js.Value) []string {
+	console.Call("log", p.indent(), "ContinueStatement:", obj)
+	res := []string{}
+	return res
+}
+
+func (p *Parser) parseBreakStatement(obj js.Value) []string {
+	console.Call("log", p.indent(), "BreakStatement:", obj)
+	res := []string{}
+	return res
+}
+
+func (p *Parser) parseNewExpression(obj js.Value) []string {
+	console.Call("log", p.indent(), "NewExpression:", obj)
+	res := []string{}
+	return res
+}
+
+func (p *Parser) parseComputedMemberExpression(obj js.Value) []string {
+	console.Call("log", p.indent(), "ComputedMemberExpression:", obj)
+	res := []string{}
+	return res
 }
 
 func (p *Parser) parseArray(body js.Value, suffix ...string) []string {
@@ -299,16 +560,28 @@ func (p *Parser) parseStatement(obj js.Value) []string {
 	case "Literal":
 		res = append(res, p.parseLiteral(obj)...)
 	case "Identifier":
-		res = append(res, p.parseIdentifier(obj)...)
+		if p.getDefineMode() {
+			res = append(res, p.parseIdentifier(obj))
+		} else {
+			res = append(res, p.parseIdentifierRef(obj)...)
+		}
+	case "Property":
+		res = append(res, p.parseProperty(obj)...)
 	case "BlockStatement":
 		console.Call("log", p.indent(), "BlockStatement:", obj)
+		p.push(obj)
 		res = append(res, p.parseArray(obj.Get("body"))...)
+		p.pop()
 	case "ClassBody":
 		console.Call("log", p.indent(), "ClassBody:", obj)
+		p.push(obj)
 		res = append(res, p.parseArray(obj.Get("body"))...)
+		p.pop()
 	case "ExpressionStatement":
 		console.Call("log", p.indent(), "ExpressionStatement:", obj)
+		p.push(obj)
 		res = append(res, p.parseStatement(obj.Get("expression"))...)
+		p.pop()
 	case "VariableDeclarator":
 		res = append(res, p.parseVariableDeclarator(obj)...)
 	case "VariableDeclaration":
@@ -316,66 +589,65 @@ func (p *Parser) parseStatement(obj js.Value) []string {
 	case "FunctionExpression":
 		res = append(res, p.parseFunctionExpression(obj)...)
 	case "ThisExpression":
-		console.Call("log", p.indent(), "ThisExpression:", obj)
+		res = append(res, p.parseThisExpression(obj)...)
 	case "ObjectExpression":
-		console.Call("log", p.indent(), "ObjectExpression:", obj)
+		res = append(res, p.parseObjectExpression(obj)...)
 	case "BinaryExpression":
 		console.Call("log", p.indent(), "BinaryExpression:", obj)
 	case "LogicalExpression":
 		console.Call("log", p.indent(), "LogicalExpression:", obj)
 	case "ArrayExpression":
-		console.Call("log", p.indent(), "ArrayExpression:", obj)
+		res = append(res, p.parseArrayExpression(obj)...)
 	case "ThrowStatement":
-		console.Call("log", p.indent(), "ThrowStatement:", obj)
+		res = append(res, p.parseThrowStatement(obj)...)
 	case "ConditionalExpression":
-		console.Call("log", p.indent(), "ConditionalExpression:", obj)
+		res = append(res, p.parseConditionalExpression(obj)...)
 	case "CallExpression":
 		res = append(res, p.parseCallExpression(obj)...)
-		log.Println(res)
 	case "AssignmentExpression":
-		p.parseAssignmentExpression(obj)
+		res = append(res, p.parseAssignmentExpression(obj)...)
 	case "AwaitExpression":
-		p.parseAwaitExpression(obj)
+		res = append(res, p.parseAwaitExpression(obj)...)
 	case "ArrowFunctionExpression":
-		p.parseArrowFunctionExpression(obj)
+		res = append(res, p.parseArrowFunctionExpression(obj)...)
 	case "SequenceExpression":
-		console.Call("log", p.indent(), "SequenceExpression:", obj)
+		res = append(res, p.parseSequenceExpression(obj)...)
 	case "UpdateExpression":
-		console.Call("log", p.indent(), "UpdateExpression:", obj)
+		res = append(res, p.parseUpdateExpression(obj)...)
 	case "ContinueStatement":
-		console.Call("log", p.indent(), "ContinueStatement:", obj)
+		res = append(res, p.parseContinueStatement(obj)...)
 	case "BreakStatement":
-		console.Call("log", p.indent(), "BreakStatement:", obj)
+		res = append(res, p.parseBreakStatement(obj)...)
 	case "NewExpression":
-		console.Call("log", p.indent(), "NewExpression:", obj)
+		res = append(res, p.parseNewExpression(obj)...)
 	case "ComputedMemberExpression":
-		console.Call("log", p.indent(), "ComputedMemberExpression:", obj)
+		res = append(res, p.parseComputedMemberExpression(obj)...)
 	case "MemberExpression":
 		res = append(res, p.parseMemberExpression(obj)...)
 	case "ReturnStatement":
-		p.parseReturnStatement(obj)
+		res = append(res, p.parseReturnStatement(obj)...)
 	case "FunctionDeclaration":
 		res = append(res, p.parseFunctionDeclaration(obj)...)
 	case "ClassDeclaration":
-		p.parseClassDeclaration(obj)
+		res = append(res, p.parseClassDeclaration(obj)...)
 	case "SwitchStatement":
-		p.parseSwitchStatement(obj)
+		res = append(res, p.parseSwitchStatement(obj)...)
 	case "SwitchCase":
-		console.Call("log", p.indent(), "SwitchCase:", obj)
+		res = append(res, p.parseSwitchCase(obj)...)
 	case "WhileStatement":
-		p.parseWhileStatement(obj)
+		res = append(res, p.parseWhileStatement(obj)...)
 	case "DoWhileStatement":
-		p.parseDoWhileStatement(obj)
+		res = append(res, p.parseDoWhileStatement(obj)...)
 	case "ForStatement":
-		p.parseForStatement(obj)
+		res = append(res, p.parseForStatement(obj)...)
 	case "ForInStatement":
-		p.parseForInStatement(obj)
+		res = append(res, p.parseForInStatement(obj)...)
 	case "IfStatement":
-		p.parseIfStatement(obj)
+		res = append(res, p.parseIfStatement(obj)...)
 	case "TryStatement":
-		p.parseTryStatement(obj)
+		res = append(res, p.parseTryStatement(obj)...)
 	case "MethodDefinition":
-		p.parseMethodDefinition(obj)
+		res = append(res, p.parseMethodDefinition(obj)...)
 	}
 	return res
 }
